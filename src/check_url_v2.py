@@ -1,21 +1,19 @@
 """
-check_url_v2: two-signal misinformation check.
+check_url_v2: two-signal misinformation check (style + evidence).
 
 Signal 1 (STYLE):    fine-tuned RoBERTa — how the text is written.
-Signal 2 (EVIDENCE): web corroboration — do independent sources report
+Signal 2 (EVIDENCE): web corroboration — do independent outlets report
                      the same STORY (not just the same topic)?
+
+Verdicts are three-tier and evidence-first:
+  CORROBORATED    — multiple trusted outlets report the same story
+  UNVERIFIED      — no independent corroboration found (could be fake,
+                    satire, or just very fresh/niche news)
+  LIKELY FAKE     — debunk coverage found, or both signals point to fake
 
 Usage:
     pip install trafilatura ddgs
     python src/check_url_v2.py https://example.com/article
-
-Honest limitations (state these in the report):
-- Corroboration checks whether the EVENT is reported elsewhere, not whether
-  every claim in the article is true.
-- Very fresh news may have few sources yet (false "suspicious").
-- Story matching uses word overlap between headlines; heavily rephrased
-  headlines of the same story can be rejected (semantic embeddings would
-  fix this — future work).
 """
 
 import re
@@ -27,9 +25,9 @@ import trafilatura
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 try:
-    from ddgs import DDGS          # new package name
+    from ddgs import DDGS
 except ImportError:
-    from duckduckgo_search import DDGS  # older name, same API
+    from duckduckgo_search import DDGS
 
 MODEL_DIR = "models/roberta-fakenews"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -48,31 +46,37 @@ SATIRE = {
 DEBUNK_WORDS = ("fact check", "fact-check", "debunk", "false claim",
                 "no evidence", "satire", "hoax", "misleading")
 
-# Social platforms and aggregators repost anything (including the source's
-# own posts) — they are NOT independent corroboration.
+# Social platforms, blog hosts and aggregators repost anything (including a
+# source's own posts) — they are NOT independent corroboration.
 SOCIAL_AGGREGATORS = {
     "facebook.com", "m.facebook.com", "youtube.com", "m.youtube.com",
     "twitter.com", "x.com", "reddit.com", "instagram.com", "tiktok.com",
-    "pinterest.com", "threads.net", "linkedin.com", "t.me", "telegram.me",
+    "pinterest.com", "threads.net", "threads.com", "bsky.app",
+    "mastodon.social", "linkedin.com", "t.me", "telegram.me", "vk.com",
+    "ok.ru", "tumblr.com", "medium.com", "quora.com",
     "upstract.com", "flipboard.com", "news.google.com", "ground.news",
     "feedly.com", "paperblog.com", "head-topics.com", "headtopics.com",
 }
+# Anything whose domain contains these fragments is also treated as social.
+SOCIAL_FRAGMENTS = ("facebook.", "youtube.", "threads.", "twitter.",
+                    "reddit.", "tiktok.", "instagram.")
 
 STOPWORDS = {
     "the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or",
     "is", "are", "was", "were", "with", "by", "from", "as", "after",
     "over", "new", "says", "say", "said",
 }
-
-# Require this share of the article headline's content words to appear in a
-# search-result title before counting it as the same story.
-# Lower it to 0.5 if genuine reprints are being rejected too often.
-STORY_MATCH_THRESHOLD = 0.6
+STORY_MATCH_THRESHOLD = 0.6  # lower to 0.5 if genuine reprints get rejected
 
 
 def domain_of(url: str) -> str:
     d = urlparse(url).netloc.lower()
     return d[4:] if d.startswith("www.") else d
+
+
+def is_social(domain: str) -> bool:
+    return (domain in SOCIAL_AGGREGATORS
+            or any(f in domain for f in SOCIAL_FRAGMENTS))
 
 
 def content_words(title: str) -> set:
@@ -102,13 +106,9 @@ def style_score(text: str) -> float:
     return float(probs[1])
 
 
-def corroboration_score(title: str, source_domain: str):
-    """
-    Search the headline; count independent domains whose result title
-    matches the same STORY (word-overlap check), not just the same topic.
-    Returns (suspicion in [0,1], details dict). Higher suspicion = less
-    corroborated.
-    """
+def gather_evidence(title: str, source_domain: str):
+    """Search the headline; classify hits into independent / trusted /
+    debunk / rejected. Returns a details dict."""
     query = re.sub(r"[\"'\u201c\u201d]", "", title)[:120]
     story_words = content_words(title)
 
@@ -122,46 +122,53 @@ def corroboration_score(title: str, source_domain: str):
         d = domain_of(h["url"])
         if not d or d == source_domain:
             continue
-        if d in SOCIAL_AGGREGATORS or d.endswith(".facebook.com"):
-            rejected.append(f"[social/aggregator] {h['title'][:45]}")
+        if is_social(d):
+            rejected.append(f"[social] {h['title'][:45]}")
             continue
         title_l = h["title"].lower()
         if any(w in title_l for w in DEBUNK_WORDS):
-            debunk_hits.append(h)
+            debunk_hits.append(h["title"][:80])
             continue
-        # STORY MATCH: a topic-only hit (e.g. any NASA/Mars page for a fake
-        # "lump on Mars" story) shares few content words with the headline
-        # and gets rejected here.
         overlap = len(story_words & content_words(h["title"]))
         if not story_words or overlap / len(story_words) < STORY_MATCH_THRESHOLD:
-            rejected.append(h["title"][:60])
+            rejected.append(f"[topic-only] {h['title'][:45]}")
             continue
         independent.add(d)
         if d in TRUSTED:
             trusted_hits.add(d)
 
-    n_ind, n_tru = len(independent), len(trusted_hits)
-    if n_tru >= 2:
-        suspicion = 0.0
-    elif n_tru == 1 or n_ind >= 4:
-        suspicion = 0.25
-    elif n_ind >= 2:
-        suspicion = 0.5
-    elif n_ind == 1:
-        suspicion = 0.75
-    else:
-        suspicion = 1.0
-    if debunk_hits:
-        suspicion = max(suspicion, 0.75)   # debunks are a red flag on their own
-
-    details = {
+    return {
         "query": query,
-        "independent_domains": sorted(independent)[:10],
-        "trusted_domains": sorted(trusted_hits),
-        "debunk_results": [h["title"][:80] for h in debunk_hits[:3]],
+        "independent": sorted(independent),
+        "trusted": sorted(trusted_hits),
+        "debunks": debunk_hits[:3],
         "rejected": rejected[:6],
     }
-    return suspicion, details
+
+
+def decide(p_fake_style: float, ev: dict, is_satire_source: bool):
+    """
+    Transparent, evidence-first decision rules (in priority order):
+    1. Known satire source                       -> SATIRE
+    2. Debunk coverage found                     -> LIKELY FAKE
+    3. >=2 trusted outlets carry the story       -> CORROBORATED (real)
+    4. No independent corroboration at all       -> UNVERIFIED
+       (style cannot rescue an unverifiable story — we showed empirically
+        that professional satire fools the style model)
+    5. Weak corroboration (1-3 independent)      -> lean on style:
+         style says fake (>=0.5) -> LIKELY FAKE, else WEAKLY CORROBORATED
+    """
+    if is_satire_source:
+        return "SATIRE (known satire outlet)"
+    if ev["debunks"]:
+        return "LIKELY FAKE (debunk coverage found)"
+    if len(ev["trusted"]) >= 2:
+        return "CORROBORATED — LIKELY REAL"
+    if len(ev["independent"]) == 0:
+        return "UNVERIFIED — no independent source reports this story"
+    if p_fake_style >= 0.5:
+        return "LIKELY FAKE (weak corroboration + fake-leaning style)"
+    return "WEAKLY CORROBORATED — treat with caution"
 
 
 def main():
@@ -177,36 +184,30 @@ def main():
         title = text.split(".")[0][:120]
     print(f"Title: {title}\n")
 
-    if src in SATIRE:
-        print(f"NOTE: {src} is a known satire outlet — content is intentionally "
-              "fictional, regardless of any score below.\n")
-
     p_fake_style = style_score(text)
-    suspicion, det = corroboration_score(title, src)
-
-    combined = 0.5 * p_fake_style + 0.5 * suspicion
-    verdict = ("LIKELY FAKE / UNVERIFIED" if combined >= 0.5
-               else "LIKELY REAL")
+    ev = gather_evidence(title, src)
+    verdict = decide(p_fake_style, ev, src in SATIRE)
 
     print("=" * 56)
     print(f"STYLE model      P(fake) = {p_fake_style:.3f}")
-    print(f"EVIDENCE check   suspicion = {suspicion:.2f}")
-    print(f"  search query:        {det['query']}")
-    print(f"  independent domains: {len(det['independent_domains'])} "
-          f"{det['independent_domains']}")
-    print(f"  trusted outlets:     {det['trusted_domains'] or 'none'}")
-    if det["debunk_results"]:
-        print(f"  debunk-style hits:   {det['debunk_results']}")
-    if det.get("rejected"):
-        print(f"  rejected hits:       {det['rejected']}")
+    print(f"EVIDENCE check")
+    print(f"  search query:        {ev['query']}")
+    print(f"  independent domains: {len(ev['independent'])} {ev['independent'][:10]}")
+    print(f"  trusted outlets:     {ev['trusted'] or 'none'}")
+    if ev["debunks"]:
+        print(f"  debunk-style hits:   {ev['debunks']}")
+    if ev["rejected"]:
+        print(f"  rejected hits:       {ev['rejected']}")
     print("-" * 56)
-    print(f"COMBINED = {combined:.2f}  ->  {verdict}")
+    print(f"VERDICT: {verdict}")
     print("=" * 56)
     print("\nHow to read this: STYLE judges how the text is written; "
-          "EVIDENCE judges whether independent outlets report the same story. "
-          "They can disagree — professionally written satire fools STYLE "
-          "but fails EVIDENCE; a clumsy retelling of a true story does the "
-          "opposite. Neither signal verifies individual claims.")
+          "EVIDENCE judges whether independent outlets report the same "
+          "story. Verdicts are evidence-first because we showed the style "
+          "model is blind to professionally written satire. UNVERIFIED "
+          "means no corroboration was found — possibly fake, possibly "
+          "just very fresh or niche. Neither signal verifies individual "
+          "claims inside the article.")
 
 
 if __name__ == "__main__":
