@@ -100,6 +100,7 @@ def main():
         ("kaggle_test", "data/test.csv"),
         ("liar_test", "data/cross_domain_test.csv"),
         ("fnn_test", "data/fnn_test.csv"),
+        ("onion_test", "data/onion_test.csv"),
     ]:
         df = pd.read_csv(path)
         probs = predict_probs(df.text.tolist(), tokenizer, model)
