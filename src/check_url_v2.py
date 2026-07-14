@@ -39,7 +39,7 @@ TRUSTED = {
     "dw.com", "france24.com", "euronews.com", "politico.com", "axios.com",
 }
 SATIRE = {
-    "babylonbee.com", "clickhole.com",
+    "theonion.com", "babylonbee.com", "clickhole.com",
     "waterfordwhispersnews.com", "thebeaverton.com", "newsthump.com",
     "duffelblog.com",
 }
