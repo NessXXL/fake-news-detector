@@ -29,7 +29,7 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-MODEL_DIR = "models/roberta-fakenews"
+MODEL_DIR = "models/roberta-fakenews/checkpoint-8000"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 TRUSTED = {
@@ -184,7 +184,7 @@ def main():
         title = text.split(".")[0][:120]
     print(f"Title: {title}\n")
 
-    p_fake_style = style_score(text)
+    p_fake_style = style_score(f"{title}. {text}")
     ev = gather_evidence(title, src)
     verdict = decide(p_fake_style, ev, src in SATIRE)
 
