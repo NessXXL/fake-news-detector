@@ -1,69 +1,82 @@
-# Misinformation Detection: Style Has a Ceiling
+# AI Misinformation Detection: Style + Evidence
 
-Research question: **Can a fine-tuned transformer detect misinformation beyond
-its training domain — and does it know when it doesn't know?**
+**Research question:** Can an AI model detect misinformation beyond its training domain — and does it know when it doesn't know?
 
-## Key findings
+Built during the [Stanford Pre-Collegiate Summer Institutes], AI major track, 2026.
 
-| Test set | Genre | Accuracy | F1 | ECE |
+## Overview
+
+We built a two-signal system for detecting misinformation:
+- **STYLE** — a fine-tuned RoBERTa transformer that judges *how* an article is written
+- **EVIDENCE** — a web-search module that checks *whether* independent outlets report the same story
+
+Along the way, we found and fixed hidden data leakage that had inflated our first model's accuracy to a misleading 99.97%, then tested the model across four different text genres to measure how well it actually generalizes.
+
+## Key results
+
+| Test set | Genre | Accuracy | F1 | ECE ↓ |
 |---|---|---|---|---|
-| Kaggle ISOT | long articles | 99.9% | 0.999 | 0.0005 |
-| FakeNewsNet | headlines | 80.9% | 0.717 | 0.109 |
-| LIAR | short claims | 62.8% | 0.611 | 0.130 |
+| Kaggle ISOT | long news articles | 99.98% | 0.9998 | 0.000 |
+| OnionOrNot | satire headlines | 93.4% | 0.913 | 0.052 |
+| FakeNewsNet | headlines | 80.5% | 0.713 | 0.158 |
+| LIAR | short political claims | 63.4% | 0.565 | 0.243 |
 
-- Our first (single-domain) model scored 99.97% in-domain but F1 = 0.19 on
-  LIAR — it had learned dataset artifacts, not language. We found and removed
-  two leakage channels: agency datelines ("WASHINGTON (Reuters) –", 84% of
-  real articles) and an apostrophe-encoding gap between classes (47% vs 0%).
-- Multi-domain training (3 corpora) raised LIAR F1 from 0.19 to 0.61 and cut
-  calibration error from 0.42 to 0.13.
-- ~63% on short claims is a ceiling for style-based detection: a claim's
-  truth is not visible in its wording. Our live demo confirms it — The Onion
-  satire passes the style model with P(real) = 0.999.
-- `check_url_v2.py` adds a second, evidence-based signal: web corroboration
-  (do independent outlets report the same story?). Style + evidence together
-  catch cases neither signal catches alone.
+**The gradient is the finding:** the shorter the text and the more its truth depends on outside facts, the less any style-based model can see. Accuracy drops steadily from long articles → satire → headlines → short claims.
+
+## What we found along the way
+
+- **Our first model "cheated."** It scored 99.97% in-domain but collapsed to F1 = 0.19 on unseen data. We audited the raw data and found: 84% of real articles started with a dateline like "WASHINGTON (Reuters) –", and fake/real texts had different apostrophe encodings — both let the model guess the label without reading the text. We removed both leaks and added automated checks so they can't silently return.
+- **The model was blind to professional satire.** The Onion's "NASA Discovers Concerning Lump On Mars" was rated 99.9% real by early versions. We added hard training examples (OnionOrNot dataset) and fixed a bug where our URL-checker wasn't feeding the headline to the model — together this raised P(fake) on that exact article from 0.001 to 0.957.
+- **Two signals catch different failure modes.** Professionally written satire fools STYLE but fails EVIDENCE (no independent outlet reports it). A true story with a uniquely phrased headline can fail EVIDENCE's word-matching but passes STYLE. Neither signal alone is enough.
 
 ## Pipeline
 
-```
-data/Fake.csv, data/True.csv        <- Kaggle "Fake and Real News Dataset"
-data/liar/{train,valid,test}.tsv    <- https://www.cs.ucsb.edu/~william/data/liar_dataset.zip
-data/fnn/*.csv                      <- FakeNewsNet public CSVs (see below)
+```bash
+# 1. Get the datasets
+# Kaggle "Fake and Real News Dataset" -> data/Fake.csv, data/True.csv
+# LIAR: https://www.cs.ucsb.edu/~william/data/liar_dataset.zip -> data/liar/
+# FakeNewsNet public CSVs (auto-downloadable, see below)
+# OnionOrNot (Kaggle) -> data/OnionOrNot.csv
 
-pip install -r requirements.txt
-python -m textblob.download_corpora
-
-python src/data_prep.py        # cleaning, anti-leakage, mixed-domain splits
-python src/baseline.py         # TF-IDF + LogReg reference
-python src/stylometric.py      # style features (optional branch)
-python src/train_transformer.py  # fine-tune RoBERTa (GPU, ~30 min)
-python src/evaluate.py         # per-domain metrics, calibration, error dumps
-python src/explain.py          # SHAP token attributions
-python app.py                  # Gradio demo
-python src/check_url_v2.py <URL>   # style + web-evidence check of a live article
-```
-
-FakeNewsNet download:
-```
 mkdir -p data/fnn
 for f in politifact_fake politifact_real gossipcop_fake gossipcop_real; do
   wget -q -O data/fnn/$f.csv \
   https://raw.githubusercontent.com/KaiDMML/FakeNewsNet/master/dataset/$f.csv
 done
+
+pip install -r requirements.txt
+python -m textblob.download_corpora
+
+# 2. Prepare data (cleaning, anti-leakage checks, 4-domain splits)
+python src/data_prep.py
+
+# 3. Baseline for comparison
+python src/baseline.py
+
+# 4. Fine-tune the transformer (~30-60 min on a GPU)
+python src/train_transformer.py
+
+# 5. Evaluate: per-domain accuracy, F1, calibration, error analysis
+python src/evaluate.py
+
+# 6. Explainability (SHAP token attributions)
+python src/explain.py
+
+# 7. Check any live article by URL (style + web evidence)
+pip install trafilatura ddgs
+python src/check_url_v2.py <article URL>
+
+# 8. Interactive demo
+python app.py
 ```
 
 ## Limitations
 
-- The classifier judges linguistic style, not facts; well-written falsehoods pass.
-- English-only; training topics are 2016–18 US-centric.
-- Kaggle 99.9% partly reflects outlet-style separability, not truth detection.
-- Binarizing LIAR's 6 labels ("half-true" → real) is a documented judgment call.
-- Evidence check verifies that a story is independently reported, not that
-  each claim in it is true; fresh news can be under-corroborated.
+- The model judges linguistic style and event corroboration — not the truth of individual claims.
+- English-only; training topics skew 2016–20 US politics.
+- Style detection of satire isn't fully generalized — the model sometimes misses newer articles it wasn't trained on.
 
-## Authors
+## Author
 
-[Your names] — Stanford AI Summer Intensive, 2026.
-Code developed with AI assistance (per course policy); experimental design,
-debugging, analysis, and interpretation by the authors.
+Zhanibek — Stanford Pre-Collegiate Summer Institutes, AI major, 2026.
+Code developed with AI assistance (per course policy); experimental design, debugging, data auditing, and analysis by the author.
