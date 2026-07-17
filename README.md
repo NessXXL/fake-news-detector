@@ -79,4 +79,3 @@ python app.py
 ## Author
 
 Zhanibek — Stanford Pre-Collegiate Summer Institutes, AI major, 2026.
-Code developed with AI assistance (per course policy); experimental design, debugging, data auditing, and analysis by the author.
